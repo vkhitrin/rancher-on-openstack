@@ -1,0 +1,205 @@
+# As per now, database migration need to be performed after deploying pod,
+# execute '/var/local/ralph/docker-entrypoint.sh1' init from 'ralph' container
+apiVersion: apps/v1beta2
+kind: Deployment
+metadata:
+  name: ralph
+  labels:
+    workload.user.cattle.io/workloadselector: ralph
+  # Remove/change name of namespace
+  namespace: persistent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      workload.user.cattle.io/workloadselector: ralph
+  template:
+    metadata:
+      labels:
+        workload.user.cattle.io/workloadselector: ralph
+    spec:
+      # OpenStack Cinder does not allow 'ReadWriteMany', different containers may not access the same volume
+      # Leveraging emptyDir volume to share content between containers
+      # initContainer used to generate django static files
+      initContainers:
+      - name: ralph-prepare-static
+        image: allegro/ralph:latest
+        command: ["/usr/bin/ralphctl"]
+        args: ["collectstatic", "--noinput"]
+        volumeMounts:
+        - name: ralph-static-files
+          mountPath: /usr/share/ralph/static
+        - name: ralph-media-files
+          mountPath: /var/local/ralph/media
+      containers:
+      - name: ralph
+        image: allegro/ralph:latest
+        env:
+        - name: DATABASE_NAME
+          value: "ralph_ng"
+        - name: DATABASE_USER
+          value: "ralph_ng"
+        - name: DATABASE_PASSWORD
+          value: "ralph_ng"
+        - name: DATABASE_HOST
+          value: "ralph-db"
+        - name: DATABASE_PORT
+          value: "3306"
+        - name: REDIS_HOST
+          value: "127.0.0.1"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: REDIS_DB
+          value: "0"
+        ports:
+        - containerPort: 80
+          hostPort: 8000
+          name: 8000tcp8000
+          protocol: TCP
+        volumeMounts:
+        - name: ralph-static-files
+          mountPath: /usr/share/ralph/static
+        - name: ralph-media-files
+          mountPath: /var/local/ralph/media
+      - name: ralph-nginx
+        image: nginx
+        ports:
+        - containerPort: 80
+        volumeMounts:
+        - name: ralph-nginx-config
+          mountPath: /etc/nginx/conf.d/default.conf
+          subPath: default.conf
+        - name: ralph-static-files
+          mountPath: /opt/static
+        - name: ralph-media-files
+          mountPath: /opt/media
+      - name: ralph-redis
+        image: redis:3.0
+      - name: ralph-inkpy
+        image: allegro/inkpy:latest
+        env:
+        - name: REDIS_HOST
+          value: "127.0.0.1"
+        - name: REDIS_PORT
+          value: "6379"
+        - name: REDIS_DB
+          value: "0"
+      - name: ralph-db
+        image: mysql:5.7
+        ports:
+        - containerPort: 3306
+        env:
+        - name: MYSQL_DATABASE
+          value: "ralph_ng"
+        - name: MYSQL_ROOT_PASSWORD
+          value: "ralph_ng"
+        - name: MYSQL_USER
+          value: "ralph_ng"
+        - name: MYSQL_PASSWORD
+          value: "ralph_ng"
+        volumeMounts:
+        - name: ralph-dbdata
+          mountPath: /var/lib/mysql
+        args: ["--ignore-db-dir=lost+found"]
+      restartPolicy: Always
+      volumes:
+      - name: ralph-nginx-config
+        configMap:
+          name: ralph-nginx-conf
+      - name: ralph-static-files
+        emptyDir: {}
+      - name: ralph-media-files
+        emptyDir: {}
+      - name: ralph-dbdata
+        persistentVolumeClaim:
+          claimName: ralph-dbdata
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ralph
+  labels:
+    app: ralph
+spec:
+  ports:
+  - name: ralph
+    port: 8000
+    targetPort: 8000
+  selector:
+     workload.user.cattle.io/workloadselector: ralph
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ralph-nginx
+  labels:
+    app: ralph-nginx
+spec:
+  ports:
+  - name: ralph-nginx
+    port: 80
+    targetPort: 80
+  selector:
+    workload.user.cattle.io/workloadselector: ralph
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ralph-db
+  labels:
+    app: ralph-db
+spec:
+  ports:
+  - name: ralph-db
+    port: 3306
+    targetPort: 3306
+  selector:
+    workload.user.cattle.io/workloadselector: ralph
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ralph-dbdata
+  labels:
+    pvcname: ralph-dbdata
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ralph-nginx-conf
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        location /static/ {
+            alias  /opt/static/;
+            expires 1y;
+            access_log off;
+            add_header Pragma public;
+            add_header Cache-Control "public";
+        }
+
+        location /media/ {
+            alias /opt/media/;
+            add_header Content-disposition "attachment";
+            access_log off;
+        }
+
+        location / {
+            proxy_pass http://ralph:8000;
+
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
